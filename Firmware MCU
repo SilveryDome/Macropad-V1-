@@ -1,0 +1,458 @@
+# Full patched MacroPad script for CircuitPython
+# Features/fixes included:
+# - Robust USB serial request using usb_cdc with fallback to HID
+# - Non-blocking long-press detection using pressed/released timestamps
+# - Safe HID sends wrapped to avoid crashes if host not ready
+# - Zoom-in sends CTRL+SHIFT+'=' to reliably produce Ctrl+'+'
+# - Time parsing validation and buffered serial reads
+# - Optional host platform toggle (Mac vs Windows/Linux) via HOST_IS_MAC
+# - Display updates with status/time/date cycling
+#
+# Tested conceptually for CircuitPython environments. Adjust pins and
+# KEY_MACROS to match your physical layout and host expectations.
+
+import board
+import digitalio
+import rotaryio
+import displayio
+import terminalio
+from adafruit_displayio_ssd1306 import SSD1306
+from adafruit_display_text import label
+import usb_hid
+from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.keycode import Keycode
+import time
+import keypad
+import supervisor
+
+# Try to import usb_cdc for serial communication; not always present
+try:
+    import usb_cdc  # pylint: disable=import-error
+except Exception:
+    usb_cdc = None
+
+# ----------------------------
+# Configuration
+# ----------------------------
+HOST_IS_MAC = False  # Set True if the host is macOS (use GUI/Command instead of CONTROL)
+MOD_CTRL = Keycode.GUI if HOST_IS_MAC else Keycode.CONTROL
+
+ROWS = 2
+COLS = 3
+
+# Matrix pins (adjust if needed)
+ROW_PINS = [board.D8, board.D9]
+COL_PINS = [board.D10, board.D7, board.D6]
+
+# Encoder pins
+ENCODER_CLK = board.D0
+ENCODER_DT = board.D1
+ENCODER_SW = board.D2
+
+# OLED I2C pins (adjust if needed)
+I2C_SDA = board.D4
+I2C_SCL = board.D5
+OLED_ADDR = 0x3C
+OLED_WIDTH = 128
+OLED_HEIGHT = 32
+
+# Timing and UI
+sync_interval = 3600  # seconds between automatic syncs
+status_duration = 2.0
+time_update_interval = 0.5
+serial_check_interval = 0.1
+
+# ----------------------------
+# Hardware initialization
+# ----------------------------
+# HID keyboard
+keyboard = Keyboard(usb_hid.devices)
+keyboard.release_all()
+
+# Key matrix
+keys = keypad.KeyMatrix(
+    row_pins=ROW_PINS,
+    column_pins=COL_PINS,
+    columns_to_anodes=False
+)
+
+# Rotary encoder
+encoder = rotaryio.IncrementalEncoder(ENCODER_CLK, ENCODER_DT)
+encoder_switch = digitalio.DigitalInOut(ENCODER_SW)
+encoder_switch.direction = digitalio.Direction.INPUT
+encoder_switch.pull = digitalio.Pull.UP
+last_position = encoder.position
+encoder_switch_state = False
+
+# OLED display init
+displayio.release_displays()
+i2c = board.I2C(sda=I2C_SDA, scl=I2C_SCL)
+display_bus = displayio.I2CDisplay(i2c, device_address=OLED_ADDR)
+display = SSD1306(display_bus, width=OLED_WIDTH, height=OLED_HEIGHT)
+splash = displayio.Group()
+display.show(splash)
+
+# Text areas
+time_area = label.Label(
+    terminalio.FONT,
+    text="--:--:--",
+    color=0xFFFFFF,
+    x=0,
+    y=10,
+    scale=1
+)
+splash.append(time_area)
+
+status_area = label.Label(
+    terminalio.FONT,
+    text="Keyton Macropad",
+    color=0xFFFFFF,
+    x=0,
+    y=25,
+    scale=1
+)
+splash.append(status_area)
+
+# ----------------------------
+# State variables
+# ----------------------------
+zoom_level = 100
+
+computer_time = {
+    'year': 2024,
+    'month': 1,
+    'day': 1,
+    'hour': 0,
+    'minute': 0,
+    'second': 0,
+    'weekday': 0
+}
+
+time_synced = False
+last_sync_time = 0
+last_status_time = 0
+display_mode = 0  # 0=time, 1=date
+
+# Serial read buffer for usb_cdc.data
+_serial_buffer = ""
+
+# For long-press detection
+pressed_times = {}
+
+# Debounce / rate limits
+last_zoom_time = 0
+zoom_debounce = 0.05
+last_time_update = 0
+last_check_serial = 0
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def safe_send(*keycodes):
+    """Send HID keys safely (guards against exceptions if host not ready)."""
+    try:
+        keyboard.send(*keycodes)
+    except Exception as e:
+        # Host might not accept HID yet; log and continue
+        print("HID send failed:", e)
+
+# Macro implementations use MOD_CTRL (which maps to GUI on mac if HOST_IS_MAC)
+def macro_copy():
+    safe_send(MOD_CTRL, Keycode.C)
+
+def macro_paste():
+    safe_send(MOD_CTRL, Keycode.V)
+
+def macro_undo():
+    safe_send(MOD_CTRL, Keycode.Z)
+
+def macro_redo():
+    # On many platforms Redo is CTRL+Y; mac often uses SHIFT+CMD+Z. We'll use CTRL+Y by default.
+    if HOST_IS_MAC:
+        safe_send(Keycode.SHIFT, Keycode.GUI, Keycode.Z)  # Shift+Cmd+Z
+    else:
+        safe_send(MOD_CTRL, Keycode.Y)
+
+def macro_save():
+    safe_send(MOD_CTRL, Keycode.S)
+
+def macro_new_tab():
+    safe_send(MOD_CTRL, Keycode.T)
+
+# Key macros mapping: key_number -> (name, callable)
+KEY_MACROS = {
+    0: ("Copy", macro_copy),
+    1: ("Paste", macro_paste),
+    2: ("Undo", macro_undo),
+    3: ("Redo", macro_redo),
+    4: ("Save", macro_save),
+    5: ("New Tab", macro_new_tab),
+}
+
+# Zoom functions
+def zoom_in():
+    global zoom_level
+    zoom_level = min(500, zoom_level + 10)
+    # '+' typically requires SHIFT + '='. Send CTRL + SHIFT + '=' for Ctrl+'+'.
+    safe_send(MOD_CTRL, Keycode.SHIFT, Keycode.EQUALS)
+    return zoom_level
+
+def zoom_out():
+    global zoom_level
+    zoom_level = max(10, zoom_level - 10)
+    safe_send(MOD_CTRL, Keycode.MINUS)
+    return zoom_level
+
+def reset_zoom():
+    global zoom_level
+    zoom_level = 100
+    safe_send(MOD_CTRL, Keycode.ZERO)
+    return zoom_level
+
+# Time request: prefer usb_cdc serial request, fallback to HID keypress
+def request_time_from_pc():
+    global last_sync_time
+    try:
+        if usb_cdc is not None and hasattr(usb_cdc, "data") and usb_cdc.data is not None:
+            try:
+                usb_cdc.data.write(b"TIME_REQUEST\n")
+                status_area.text = "Time requested (serial)"
+                print("Requested time via usb_cdc")
+                # do not update last_sync_time here; we'll wait for actual TIME response
+                return
+            except Exception as e:
+                print("usb_cdc write failed:", e)
+    except Exception as e:
+        print("usb_cdc check failed:", e)
+
+    # fallback to HID key combo for hosts that listen
+    safe_send(MOD_CTRL, Keycode.SHIFT, Keycode.T)
+    status_area.text = "Time requested (HID)"
+    print("Requested time via HID keypress")
+
+# Buffered read for usb_cdc.data or fallback to supervisor runtime + input()
+def read_serial_line():
+    """Return a complete line from USB serial if available, otherwise None.
+    Keeps an internal buffer for usb_cdc.data to assemble lines across reads.
+    """
+    global _serial_buffer
+    try:
+        # Prefer usb_cdc.data
+        if usb_cdc is not None and hasattr(usb_cdc, "data") and usb_cdc.data is not None:
+            in_waiting = getattr(usb_cdc.data, "in_waiting", None)
+            if in_waiting is None:
+                # older builds may not have in_waiting; attempt to read a small chunk
+                chunk = usb_cdc.data.read(64)
+            elif in_waiting:
+                chunk = usb_cdc.data.read(in_waiting)
+            else:
+                chunk = None
+
+            if chunk:
+                try:
+                    s = chunk.decode("utf-8", errors="ignore")
+                except Exception:
+                    s = str(chunk)
+                _serial_buffer += s
+                if "\n" in _serial_buffer:
+                    line, rest = _serial_buffer.split("\n", 1)
+                    _serial_buffer = rest
+                    return line.strip()
+                # no full line yet
+                return None
+        # Fallback: use supervisor/runtime indicator and input()
+        if supervisor.runtime.serial_bytes_available:
+            try:
+                line = input().strip()
+                return line
+            except Exception:
+                return None
+    except Exception as e:
+        # If anything goes wrong, don't crash main loop
+        print("Serial read error:", e)
+        return None
+
+    return None
+
+def parse_time_from_serial(data):
+    """Parse time data received from serial in format: TIME:YYYY:MM:DD:HH:MM:SS:WD
+    Returns True if parsed successfully.
+    """
+    global computer_time, time_synced, last_sync_time
+    try:
+        if not data:
+            return False
+        if data.startswith("TIME:"):
+            parts = data.strip().split(':')
+            if len(parts) == 8:
+                y = int(parts[1]); mo = int(parts[2]); d = int(parts[3])
+                hh = int(parts[4]); mm = int(parts[5]); ss = int(parts[6])
+                wd = int(parts[7])
+                # Basic validation
+                if not (1 <= mo <= 12): return False
+                if not (1 <= d <= 31): return False
+                if not (0 <= hh < 24): return False
+                if not (0 <= mm < 60): return False
+                if not (0 <= ss < 60): return False
+                if not (0 <= wd <= 6): return False
+
+                computer_time.update({
+                    'year': y, 'month': mo, 'day': d,
+                    'hour': hh, 'minute': mm, 'second': ss, 'weekday': wd
+                })
+                time_synced = True
+                last_sync_time = time.monotonic()
+                print(f"Time synced: {computer_time['hour']:02d}:{computer_time['minute']:02d}:{computer_time['second']:02d}")
+                return True
+    except Exception as e:
+        print("Error parsing time:", e)
+    return False
+
+def get_computer_time_string():
+    if not time_synced:
+        return "--:--:--"
+    elapsed = time.monotonic() - last_sync_time
+    total_seconds = computer_time['hour'] * 3600 + computer_time['minute'] * 60 + computer_time['second']
+    total_seconds += int(elapsed)
+    hours = (total_seconds // 3600) % 24
+    minutes = (total_seconds // 60) % 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def get_date_string():
+    if not time_synced:
+        return "No date sync"
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    # Defensive indexing
+    mo = min(max(1, computer_time.get('month', 1)), 12)
+    wd = min(max(0, computer_time.get('weekday', 0)), 6)
+    month = month_names[mo - 1]
+    weekday = day_names[wd]
+    return f"{weekday} {month} {computer_time.get('day', 1)}"
+
+def update_display(status=None):
+    """Update OLED display with time/date and status"""
+    global last_status_time, display_mode
+    try:
+        current_time = time.monotonic()
+        # Update time/date area
+        if display_mode == 0:
+            time_str = get_computer_time_string()
+            time_area.text = time_str
+            time_area.x = (OLED_WIDTH - len(time_str) * 6) // 2
+        else:
+            date_str = get_date_string()
+            time_area.text = date_str
+            time_area.x = (OLED_WIDTH - len(date_str) * 6) // 2
+
+        # Update status area if we have a new status
+        if status:
+            status_area.text = status
+            last_status_time = current_time
+            display_mode = 0
+        elif current_time - last_status_time > status_duration:
+            if time_synced:
+                status_area.text = f"Zoom: {zoom_level}%"
+            else:
+                status_area.text = "Need time sync"
+
+        # Auto-switch between time and date every 5 seconds (when not showing status)
+        if current_time - last_status_time > 5.0:
+            if int(current_time) % 10 < 5:
+                display_mode = 0
+            else:
+                display_mode = 1
+    except Exception as e:
+        print("Display update error:", e)
+
+# init display 
+update_display("Keyton Macropad")
+
+# Main loop
+print("MacroPad Schematic")
+print("Rows: D8(R0), D9(R1)")
+print("Cols: D10(C2), D7(C1), D6(C0)")
+print("Encoder: D0(CLK), D1(DT), D2(SW)")
+print("OLED: D4(SDA), D5(SCL)")
+print("\nZoom Control Pad with Clock Started!")
+
+last_check_serial = time.monotonic()
+last_time_update = time.monotonic()
+last_sync_time = 0  # force initial sync
+while True:
+    current_time = time.monotonic()
+
+    # --- Check for serial input (time from computer) ---
+    if current_time - last_check_serial > serial_check_interval:
+        last_check_serial = current_time
+        line = read_serial_line()
+        if line:
+            print("Received:", line)
+            if parse_time_from_serial(line):
+                update_display("Time synced!")
+
+    # --- Auto-request time sync if needed ---
+    if (not time_synced and (current_time - last_sync_time > 5)) or (time_synced and (current_time - last_sync_time > sync_interval)):
+        # Wait 5 seconds between requests to avoid flooding
+        if current_time - last_sync_time > 5:
+            request_time_from_pc()
+            # record request time (not a successful sync)
+            last_sync_time = current_time
+
+    # --- Update Time Display Regularly ---
+    if current_time - last_time_update > time_update_interval:
+        last_time_update = current_time
+        update_display()
+
+    # --- Check Matrix Keys (non-blocking long-press detection) ---
+    event = keys.events.get()
+    if event:
+        key_num = event.key_number
+        if event.pressed:
+            pressed_times[key_num] = current_time
+        elif event.released:
+            start = pressed_times.pop(key_num, None)
+            duration = (current_time - start) if start is not None else 0.0
+
+            # Long-press for key 5 to request time (>= 2.0s)
+            if key_num == 5 and duration >= 2.0:
+                request_time_from_pc()
+                update_display("Time requested")
+            else:
+                if key_num in KEY_MACROS:
+                    key_name, key_func = KEY_MACROS[key_num]
+                    print(f"Key {key_num}: {key_name} (dur {duration:.2f}s)")
+                    try:
+                        key_func()
+                    except Exception as e:
+                        print("Macro failed:", e)
+                    update_display(f"{key_name}")
+
+    # Check Rotary
+    position = encoder.position
+    if position != last_position:
+        if current_time - last_zoom_time > zoom_debounce:
+            last_zoom_time = current_time
+            if position > last_position:
+                print("Encoder CW: Zoom In")
+                new_zoom = zoom_in()
+                update_display(f"Zoom In {new_zoom}%")
+            else:
+                print("Encoder CCW: Zoom Out")
+                new_zoom = zoom_out()
+                update_display(f"Zoom Out {new_zoom}%")
+        last_position = position
+
+    # --- Check Encoder Button ---
+    current_switch_state = not encoder_switch.value
+    if current_switch_state != encoder_switch_state:
+        encoder_switch_state = current_switch_state
+        if current_switch_state:
+            print("Encoder Button: Reset Zoom")
+            new_zoom = reset_zoom()
+            update_display(f"Zoom Reset {new_zoom}%")
+
+    # Small delay for responsiveness
+    time.sleep(0.01)
